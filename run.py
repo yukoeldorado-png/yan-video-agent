@@ -2,18 +2,28 @@ import os, re, time, glob, json, asyncio, subprocess, shutil, edge_tts
 from google import genai
 from google.genai import types
 
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-EPISODE    = os.environ.get("EPISODE", "Tập 1").strip()
-CRE_NAME   = "????"
-SUB_NAME   = "Ynvo IYaN (sub)"
+# ================= CẤU HÌNH MẶC ĐỊNH =================
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
+DEFAULT_SUB = "agents yan-studio"   # 👉 Tên kênh sub mặc định
+DEFAULT_CRE = ""                  # 👉 Để trống sẽ tự ẩn chữ cre
+
+# Tự động đọc cre và sub từ phần mô tả của Release (nếu có gõ)
+BODY_TEXT = os.environ.get("RELEASE_BODY", "")
+cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
+sub_match = re.search(r'(?i)sub\s*[:=]\s*(.+)', BODY_TEXT)
+
+CUSTOM_CRE = cre_match.group(1).strip() if cre_match else DEFAULT_CRE
+CUSTOM_SUB = sub_match.group(1).strip() if sub_match else DEFAULT_SUB
 
 client = genai.Client(api_key=GEMINI_KEY)
 
 YAN_PROMPT = """
 Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa hoạt hình Trung Quốc.
 TỐI HẬU THƯ:
-1. Mỗi entry phụ đề BẮT BUỘC chỉ nằm trên DUY NHẤT 1 DÒNG ĐƠN (tối đa 10-12 từ). Nếu câu dài, BẮT BUỘC ngắt làm 2 entry riêng.
-2. Định dạng: 00:mm:ss,mmm --> 00:mm:ss,mmm. CẤM DẤU NGOẶC KÉP. Không xuất lời dẫn.
+1. Dịch TOÀN BỘ video từ 00:00 đến hết video. Tuyệt đối KHÔNG bỏ dở giữa chừng.
+2. CHỈ dịch lời thoại do nhân vật nói ra mồm. TUYỆT ĐỐI BỎ QUA các bảng thông báo hệ thống, bảng thuộc tính chữ dài.
+3. Mỗi câu thoại chỉ nằm trên 1 DÒNG ĐƠN (tối đa 10-12 từ).
+4. Định dạng chuẩn: 00:mm:ss,mmm --> 00:mm:ss,mmm. CẤM DẤU NGOẶC KÉP. Không xuất lời dẫn.
 """
 
 CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -28,9 +38,7 @@ except: pass
 
 def get_video_dimensions(p):
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", p]
-    try:
-        data = json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]
-        return int(data["width"]), int(data["height"])
+    try: return int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["width"]), int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["height"])
     except: return 1920, 1080
 
 def get_audio_duration(p):
@@ -38,18 +46,31 @@ def get_audio_duration(p):
     except: return 2.0
 
 def clean_time(t):
-    t = t.strip().replace('.', ',').split(':')
-    return f"00:{int(t[0]):02d}:{t[1]}" if len(t)==2 else (f"{int(t[0]):02d}:{int(t[1]):02d}:{t[2]}" if len(t)==3 else ':'.join(t))
+    t = t.strip().replace('.', ',')
+    parts = t.split(':')
+    if len(parts) == 2:
+        s = parts[1] if ',' in parts[1] else parts[1] + ',000'
+        return f"00:{int(parts[0]):02d}:{s}"
+    elif len(parts) == 3:
+        s = parts[2] if ',' in parts[2] else parts[2] + ',000'
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{s}"
+    return t
 
 def rebuild_srt(raw):
-    matches = list(re.finditer(r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}|\d{1,2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}|\d{1,2}:\d{2}[,\.]\d{1,3})', raw))
+    raw = raw.replace('：', ':').replace('，', ',').replace('—>', '-->').replace('->', '-->')
+    ts_pattern = r'((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)'
+    matches = list(re.finditer(ts_pattern, raw))
     if not matches: return raw
     entries = []
     for i in range(len(matches)):
         st, et = clean_time(matches[i].group(1)), clean_time(matches[i].group(2))
-        lines = [l.strip() for l in raw[matches[i].end():(matches[i+1].start() if i+1<len(matches) else len(raw))].split('\n') if l.strip()]
-        txt = " ".join([l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]).replace('"', '').strip()
-        if txt: entries.append((st, et, txt))
+        p1 = matches[i].end()
+        p2 = matches[i+1].start() if i+1 < len(matches) else len(raw)
+        lines = [l.strip() for l in raw[p1:p2].split('\n') if l.strip()]
+        valid = [l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]
+        txt = " ".join(valid).replace('"', '').strip()
+        if txt and len(txt.split()) < 35:
+            entries.append((st, et, txt))
     return "\n\n".join([f"{idx}\n{s} --> {e}\n{t}" for idx, (s, e, t) in enumerate(entries, 1)])
 
 def parse_srt(p):
@@ -74,47 +95,42 @@ def generate_voice(text, out_p):
         return os.path.exists(out_p) and os.path.getsize(out_p) > 0
     except: return False
 
-def main():
-    files = glob.glob("input_dir/*.*")
-    video_files = [f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv'))]
-    if not video_files:
-        raise Exception("Không tìm thấy file video nào được tải lên!")
-    
-    raw_video = "raw_clean.mp4"
-    shutil.copyfile(video_files[0], raw_video)
-    print(f"[*] Đã nhận diện video: {video_files[0]}")
-    
-    print("[*] Đẩy video lên Google Gemini...")
-    v_file = client.files.upload(file=raw_video)
+def process_single_video(video_path, tag_name):
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    ep_display = base_name.replace("_", " ").replace("-", " ")
+    print(f"\n==================================================")
+    print(f"[*] ĐANG XỬ LÝ: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
+    print(f"==================================================")
+
+    clean_vid = "clean_target.mp4"
+    shutil.copyfile(video_path, clean_vid)
+
+    v_file = client.files.upload(file=clean_vid)
     while v_file.state.name == "PROCESSING":
         time.sleep(1.5)
         v_file = client.files.get(name=v_file.name)
-    
-    print("[*] Bóc sub AI với Gemini 3.7 / 2.0 Flash...")
+
     config = types.GenerateContentConfig(system_instruction=YAN_PROMPT, temperature=0.1)
     resp = None
     for m in ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
         try:
-            r = client.models.generate_content(model=m, contents=[v_file, "Xuất SRT chuẩn 1 dòng."], config=config)
+            r = client.models.generate_content(model=m, contents=[v_file, "Dịch video chuẩn."], config=config)
             if r and r.text: resp = r; break
         except: time.sleep(1.5)
     try: client.files.delete(name=v_file.name)
     except: pass
-    
-    srt_file = "sub.srt"
+
+    srt_file = f"sub_{base_name}.srt"
     with open(srt_file, "w", encoding="utf-8") as f: f.write(rebuild_srt(resp.text))
-    
-    # Tọa độ ôm trọn sub gốc sát đáy
-    y1_pct, y2_pct = 0.93, 1.00
-    
-    print("[*] Lồng tiếng CapCut Nguồn Nhỏ (BV421)...")
+
     items = parse_srt(srt_file)
     inputs, parts = [], []
-    os.makedirs("temp_tts", exist_ok=True)
+    temp_dir = f"temp_tts_{base_name}"
+    os.makedirs(temp_dir, exist_ok=True)
     idx = 0
     for s, e, txt in items:
         if not txt or txt.startswith("["): continue
-        p_raw, p_fit = f"temp_tts/r_{idx}.mp3", f"temp_tts/f_{idx}.mp3"
+        p_raw, p_fit = f"{temp_dir}/r_{idx}.mp3", f"{temp_dir}/f_{idx}.mp3"
         if generate_voice(txt, p_raw):
             dur = get_audio_duration(p_raw)
             max_d = max(0.5, e - s - 0.08)
@@ -126,37 +142,54 @@ def main():
             d_ms = int(s * 1000)
             parts.append(f"[{idx}]adelay={d_ms}|{d_ms}[a{idx}];")
             idx += 1
-    
-    tts_audio = "full_tts.wav"
+
+    tts_audio = f"tts_{base_name}.wav"
     subprocess.run(["ffmpeg", "-y"] + inputs + ["-filter_complex", "".join(parts) + f"{''.join([f'[a{i}]' for i in range(idx)])}amix=inputs={idx}:dropout_transition=0:normalize=0[out]", "-map", "[out]", tts_audio], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    print("[*] Render video hoàn chỉnh...")
-    w, h = get_video_dimensions(raw_video)
+
+    w, h = get_video_dimensions(clean_vid)
+    y1_pct, y2_pct = 0.93, 1.00
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = max(24, min((int(h * (y2_pct - y1_pct)) // 2) * 2, h - y_start))
     center_margin_v = max(4, int((1.0 - (y1_pct + y2_pct)/2.0) * 288 - 4))
-    
-    t_cre = CRE_NAME.replace("'", "").replace(":", " -")
-    t_sub = SUB_NAME.replace("'", "").replace(":", " -")
-    t_ep = EPISODE.replace("'", "").replace(":", " -")
-    font_org_cmd = f":fontfile='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
-    
+
+    cre_cmd = f"drawtext=text='cre - {CUSTOM_CRE}':x=25:y=20:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1," if (CUSTOM_CRE and CUSTOM_CRE != "????") else ""
+    t_sub = CUSTOM_SUB.replace("'", "").replace(":", " -")
     en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items if t]) or "1"
-    
+
     vf = (
         f"[0:v]split[m][c];"
         f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
         f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
-        f"[v1]drawtext=text='cre - {t_cre}':x=25:y=20:fontsize=16{font_org_cmd}:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
-        f"drawtext=text='sub - {t_sub}':x=25:y=42{font_org_cmd}:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
-        f"drawtext=text='{t_ep}':x=w-tw-30:y=20:fontsize=22:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
+        f"[v1]{cre_cmd}"
+        f"drawtext=text='sub - {t_sub}':x=25:y=42:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
+        f"drawtext=text='{ep_display}':x=w-tw-30:y=20:fontsize=22:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
         f"subtitles=filename='{srt_file}':force_style='FontName=Comfortaa,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
     )
     af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-    
-    subprocess.run(["ffmpeg", "-y", "-i", raw_video, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "Video_HoanThanh.mp4"], check=True)
-    print("[✓] ĐÃ XUẤT VIDEO XUẤT SẮC: Video_HoanThanh.mp4")
+
+    output_filename = f"Video_HoanThanh_{base_name}.mp4"
+    subprocess.run(["ffmpeg", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename], check=True)
+
+    print(f"[✓] Đã xuất video: {output_filename} -> Đang tải lên Release...")
+    subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"])
+    print(f"[✓] ĐÃ TẢI LÊN THÀNH CÔNG: {output_filename}")
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+def main():
+    files = glob.glob("input_dir/*.*")
+    video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
+    if not video_files: raise Exception("Không tìm thấy file video nào trong Release!")
+
+    tag = os.environ.get("RELEASE_TAG") or subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
+    print(f"[*] Tìm thấy tổng cộng {len(video_files)} video cần xử lý!")
+
+    # VÒNG LẶP XỬ LÝ LẦN LƯỢT TỪNG VIDEO
+    for vid in video_files:
+        try:
+            process_single_video(vid, tag)
+        except Exception as e:
+            print(f"[!] Lỗi khi xử lý {vid}: {e}")
 
 if __name__ == "__main__":
     main()
