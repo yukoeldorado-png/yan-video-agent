@@ -2,12 +2,10 @@ import os, re, time, glob, json, asyncio, subprocess, shutil, edge_tts
 from google import genai
 from google.genai import types
 
-# ================= CẤU HÌNH MẶC ĐỊNH =================
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
-DEFAULT_SUB = "agents yan-studio"   # 👉 Tên kênh sub mặc định
-DEFAULT_CRE = ""                  # 👉 Để trống sẽ tự ẩn chữ cre
+DEFAULT_SUB = "YaNstudio AI"
+DEFAULT_CRE = ""
 
-# Tự động đọc cre và sub từ phần mô tả của Release (nếu có gõ)
 BODY_TEXT = os.environ.get("RELEASE_BODY", "")
 cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
 sub_match = re.search(r'(?i)sub\s*[:=]\s*(.+)', BODY_TEXT)
@@ -98,11 +96,9 @@ def generate_voice(text, out_p):
 def process_single_video(video_path, tag_name):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     ep_display = base_name.replace("_", " ").replace("-", " ")
-    print(f"\n==================================================")
-    print(f"[*] ĐANG XỬ LÝ: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
-    print(f"==================================================")
+    print(f"\n[*] ĐANG XỬ LÝ: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
 
-    clean_vid = "clean_target.mp4"
+    clean_vid = f"clean_{base_name}.mp4"
     shutil.copyfile(video_path, clean_vid)
 
     v_file = client.files.upload(file=clean_vid)
@@ -114,11 +110,18 @@ def process_single_video(video_path, tag_name):
     resp = None
     for m in ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
         try:
-            r = client.models.generate_content(model=m, contents=[v_file, "Dịch video chuẩn."], config=config)
+            print(f"[*] Đang dịch với model {m}...")
+            r = client.models.generate_content(model=m, contents=[v_file, "Dịch toàn bộ video sang tiếng Việt."], config=config)
             if r and r.text: resp = r; break
-        except: time.sleep(1.5)
+        except Exception as e:
+            print(f"[!] {m} bận: {e}")
+            time.sleep(1.5)
+            
     try: client.files.delete(name=v_file.name)
     except: pass
+    
+    if not resp or not resp.text:
+        raise Exception("Không thể lấy phụ đề từ Gemini!")
 
     srt_file = f"sub_{base_name}.srt"
     with open(srt_file, "w", encoding="utf-8") as f: f.write(rebuild_srt(resp.text))
@@ -171,9 +174,11 @@ def process_single_video(video_path, tag_name):
     output_filename = f"Video_HoanThanh_{base_name}.mp4"
     subprocess.run(["ffmpeg", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename], check=True)
 
-    print(f"[✓] Đã xuất video: {output_filename} -> Đang tải lên Release...")
-    subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"])
-    print(f"[✓] ĐÃ TẢI LÊN THÀNH CÔNG: {output_filename}")
+    print(f"[✓] Đã render xong: {output_filename}")
+    if tag_name:
+        subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"])
+        print(f"[✓] Đã upload lên Release: {tag_name}")
+        
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
@@ -181,15 +186,13 @@ def main():
     video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
     if not video_files: raise Exception("Không tìm thấy file video nào trong Release!")
 
-    tag = os.environ.get("RELEASE_TAG") or subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
-    print(f"[*] Tìm thấy tổng cộng {len(video_files)} video cần xử lý!")
-
-    # VÒNG LẶP XỬ LÝ LẦN LƯỢT TỪNG VIDEO
+    tag = os.environ.get("RELEASE_TAG", "").strip()
+    if not tag:
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
+        
+    print(f"[*] Tìm thấy {len(video_files)} video. Bắt đầu xử lý...")
     for vid in video_files:
-        try:
-            process_single_video(vid, tag)
-        except Exception as e:
-            print(f"[!] Lỗi khi xử lý {vid}: {e}")
+        process_single_video(vid, tag)
 
 if __name__ == "__main__":
     main()
