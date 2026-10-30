@@ -2,12 +2,10 @@ import os, re, time, glob, json, asyncio, subprocess, shutil, edge_tts
 from google import genai
 from google.genai import types
 
-# ================= CẤU HÌNH CƠ BẢN =================
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
 CRE_NAME   = os.environ.get("CREATOR", "").strip()
 SUB_NAME   = "IYaNstudio AI"
 
-# Lấy tên cre và sub từ phần mô tả của GitHub Release (nếu có)
 BODY_TEXT = os.environ.get("RELEASE_BODY", "")
 cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
 sub_match = re.search(r'(?i)sub\s*[:=]\s*(.+)', BODY_TEXT)
@@ -17,19 +15,18 @@ CUSTOM_SUB = sub_match.group(1).strip() if sub_match else SUB_NAME
 
 client = genai.Client(api_key=GEMINI_KEY)
 
-# LUẬT DỊCH THUẬT SIÊU CHẶT CHẼ
+# ÉP LỆNH TỐI CẤM AI KHÔNG ĐƯỢC LẢI NHẢI
 YAN_PROMPT = """
-Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa hoạt hình Trung Quốc.
-TỐI HẬU THƯ QUAN TRỌNG:
-1. Dịch TOÀN BỘ video từ 00:00 đến hết video. BẮT BUỘC xuất ra định dạng file .SRT tiêu chuẩn.
-2. Cấu trúc chuẩn từng entry bắt đầu từ số 1:
+Persona: YaN - Chuyên gia Biên dịch ngôn ngữ hoạt hình Trung Quốc.
+TỐI HẬU THƯ CỰC KỲ QUAN TRỌNG:
+1. TUYỆT ĐỐI KHÔNG DÙNG TỪ NGỮ CHÀO HỎI (Không "Dưới đây là...", Không "Ok"). Chữ đầu tiên xuất ra BẮT BUỘC phải là số "1".
+2. Chỉ dịch lời thoại nhân vật. BỎ QUA HOÀN TOÀN chữ trên màn hình, thông báo hệ thống.
+3. Cấu trúc chuẩn từng entry bắt đầu từ số 1:
 1
 00:00:01,000 --> 00:00:03,000
-Câu thoại dịch tiếng Việt ngắn gọn
+Câu thoại dịch tiếng Việt
 
-3. CHỈ dịch lời thoại do nhân vật nói ra mồm. TUYỆT ĐỐI BỎ QUA bảng thông báo hệ thống, bảng thuộc tính chữ dài.
-4. Mỗi câu thoại chỉ nằm trên 1 DÒNG ĐƠN (tối đa 10-12 từ).
-5. Tuyệt đối không viết thêm bất kỳ lời dẫn hay giải thích nào khác ngoài cấu trúc file SRT.
+4. Mỗi câu thoại BẮT BUỘC chỉ nằm trên 1 DÒNG ĐƠN. Định dạng: 00:mm:ss,mmm --> 00:mm:ss,mmm.
 """
 
 CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -39,16 +36,16 @@ if not os.path.exists(CJK_FONT):
 capcut_client = None
 try:
     from capcut_tts_api import CapCutClient
-    capcut_client = CapCutClient(timeout=20)
+    capcut_client = CapCutClient(timeout=45)
 except: pass
 
 def get_video_dimensions(p):
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", p]
-    try: return int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True, timeout=10).stdout)["streams"][0]["width"]), int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True, timeout=10).stdout)["streams"][0]["height"])
+    try: return int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["width"]), int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["height"])
     except: return 1920, 1080
 
 def get_audio_duration(p):
-    try: return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True, timeout=10).stdout.strip())
+    try: return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True).stdout.strip())
     except: return 2.0
 
 def to_seconds(t_str):
@@ -77,6 +74,8 @@ def format_time(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def extract_subtitles_from_text(raw_text):
+    # Cắt bỏ mọi suy nghĩ <think>...</think> của AI mới
+    raw_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL | re.IGNORECASE)
     raw_text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
     raw_text = re.sub(r'^```(?:srt)?\s*', '', raw_text, flags=re.MULTILINE)
     raw_text = re.sub(r'\s*```$', '', raw_text, flags=re.MULTILINE)
@@ -90,41 +89,34 @@ def extract_subtitles_from_text(raw_text):
         st_sec = to_seconds(matches[i].group(1))
         et_sec = to_seconds(matches[i].group(2))
         p1 = matches[i].end()
-        p2 = matches[i+1].start() if i+1 < len(matches) else len(raw_text)
+        p2 = matches[i+1].start() if i+1 < len(raw_text) else len(raw_text)
         
         lines = [l.strip() for l in raw_text[p1:p2].split('\n') if l.strip()]
         valid = [l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]
         txt = " ".join(valid).replace('"', '').strip()
         
-        # Bỏ qua bảng thông báo hệ thống dài thượt (trên 35 từ)
-        if txt and len(txt.split()) < 35 and et_sec > st_sec:
+        if txt and len(txt.split()) < 50 and et_sec > st_sec:
             items.append((st_sec, et_sec, txt))
             
     return items
 
-async def generate_voice_async(text, out_p):
-    if capcut_client:
-        for _ in range(3):
-            try:
-                loop = asyncio.get_event_loop()
-                res = await asyncio.wait_for(loop.run_in_executor(None, capcut_client.generate_speech, text, "BV421_vivn_streaming", 15), timeout=18)
-                await asyncio.wait_for(loop.run_in_executor(None, capcut_client.download_tts_audio, res, out_p), timeout=15)
-                if os.path.exists(out_p) and os.path.getsize(out_p) > 0: return True
-            except:
-                await asyncio.sleep(1.0)
-    try:
-        await asyncio.wait_for(edge_tts.Communicate(text, "vi-VN-HoaiMyNeural", pitch="+16Hz", rate="+8%").save(out_p), timeout=15)
-        return os.path.exists(out_p) and os.path.getsize(out_p) > 0
-    except: return False
-
 def generate_voice(text, out_p):
-    try: return asyncio.run(generate_voice_async(text, out_p))
+    if capcut_client:
+        for _ in range(5):
+            try:
+                res = capcut_client.generate_speech(text, voice="BV421_vivn_streaming", timeout=30)
+                capcut_client.download_tts_audio(res, out_p)
+                if os.path.exists(out_p) and os.path.getsize(out_p) > 0: return True
+            except: time.sleep(1.5)
+    try:
+        asyncio.run(edge_tts.Communicate(text, "vi-VN-HoaiMyNeural", pitch="+16Hz", rate="+8%").save(out_p))
+        return os.path.exists(out_p) and os.path.getsize(out_p) > 0
     except: return False
 
 def process_single_video(video_path, tag_name):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     print(f"\n=================================================")
-    print(f"[*] ĐANG XỬ LÝ VIDEO: {base_name}")
+    print(f"[*] ĐANG XỬ LÝ VIDEO: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
     print(f"=================================================")
 
     clean_vid = f"clean_{base_name}.mp4"
@@ -138,10 +130,9 @@ def process_single_video(video_path, tag_name):
         v_file = client.files.get(name=v_file.name)
 
     config = types.GenerateContentConfig(system_instruction=YAN_PROMPT, temperature=0.1)
-    user_prompt = "Hãy tạo file phụ đề SRT hoàn chỉnh từ 00:00 đến hết video cho toàn bộ lời thoại nhân vật. Bắt đầu từ số 1:"
+    user_prompt = "Dịch TOÀN BỘ video. Cấm nói chuyện. Bắt đầu ngay bằng số 1:"
 
     resp = None
-    # Chạy lần lượt các model siêu tốc, tốt nhất hiện tại của Gemini
     for m in ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash"]:
         try:
             print(f"[*] Đang bóc sub với model {m}...")
@@ -162,15 +153,22 @@ def process_single_video(video_path, tag_name):
 
     items = extract_subtitles_from_text(resp.text)
     print(f"[✓] Đã bóc tách được {len(items)} câu thoại chuẩn!")
+    
+    # BẬT ĐÈN PHA DEBUG NẾU AI LẢI NHẢI TRẢ VỀ 0 CÂU
     if not items:
-        raise Exception("Không nhận diện được câu thoại nào!")
+        print("\n" + "="*50)
+        print("🚨 LỖI NGHIÊM TRỌNG: AI TRẢ VỀ ĐỊNH DẠNG SAI!")
+        print("👇 CHI TIẾT NỘI DUNG AI NÓI (DEBUG):")
+        print(resp.text[:1500])
+        print("="*50 + "\n")
+        raise Exception("Không nhận diện được câu thoại nào! Hãy xem chi tiết nội dung AI nói ở log bên trên.")
 
     srt_file = f"sub_{base_name}.srt"
     with open(srt_file, "w", encoding="utf-8") as f:
         for idx, (s, e, t) in enumerate(items, 1):
             f.write(f"{idx}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n")
 
-    print("[*] Đang lồng tiếng CapCut (bảo vệ chống treo ngắt mạng)...")
+    print("[*] Đang lồng tiếng CapCut (có timeout ngắt mạng)...")
     inputs, parts = [], []
     temp_dir = f"temp_tts_{base_name}"
     os.makedirs(temp_dir, exist_ok=True)
@@ -198,20 +196,14 @@ def process_single_video(video_path, tag_name):
             has_audio = True
 
     w, h = get_video_dimensions(clean_vid)
-    
-    # Kích thước khung làm mờ mặc định (sát đáy 16:9, che trọn sub cũ)
     y1_pct, y2_pct = 0.90, 1.00
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = max(24, min((int(h * (y2_pct - y1_pct)) // 2) * 2, h - y_start))
-    
-    # Căn giữa phụ đề tuyệt đối vào khung làm mờ
-    y_center = y_start + (crop_h // 2)
-    center_margin_v = max(4, int(h - y_center - (15 / 2)))
+    center_margin_v = max(4, int(h - (y_start + crop_h//2) - 7))
 
     cre_cmd = f"drawtext=text='cre - {CUSTOM_CRE}':x=25:y=20:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1," if (CUSTOM_CRE and CUSTOM_CRE != "????") else ""
     t_sub = CUSTOM_SUB.replace("'", "").replace(":", " -")
     
-    # Vệt mờ chỉ bật lúc có chữ, tắt lúc hết chữ (Dài thêm 0.1s ở đuôi cho mịn)
     en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items]) or "1"
 
     vf = (
@@ -221,6 +213,47 @@ def process_single_video(video_path, tag_name):
         f"[v1]{cre_cmd}"
         f"drawtext=text='sub - {t_sub}':x=25:y=42:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
+        f"subtitles=filename='{srt_file}':force_style='FontName=Comfortaa,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
+    )
+
+    output_filename = f"Video_HoanThanh_{base_name}.mp4"
+    if has_audio:
+        duck_str = "+".join([f"between(t,{max(0, s-0.05):.2f},{e+0.05:.2f})" for s, e, t in items]) or "0"
+        af = f"[0:a]stereotools=mlev=0.1,volume='if({duck_str}, 0.05, 1.0)':eval=frame[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
+    else:
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
+
+    print("[*] Đang render video hoàn chỉnh bằng FFmpeg...")
+    res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
+    if res.returncode != 0:
+        raise Exception(f"Lỗi FFmpeg: {res.stderr[-300:]}")
+
+    print(f"[✓] Đã render xong: {output_filename}")
+    if tag_name:
+        subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"], timeout=60)
+        print(f"[✓] Đã đính kèm video vào mục Release!")
+        
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+def main():
+    files = glob.glob("input_dir/*.*")
+    video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
+    if not video_files: raise Exception("Không tìm thấy file video nào tải lên!")
+
+    tag = os.environ.get("RELEASE_TAG", "").strip()
+    if not tag:
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True, timeout=10).stdout.strip()
+        
+    print(f"[*] TÌM THẤY {len(video_files)} VIDEO. HỆ THỐNG BẮT ĐẦU CHẠY HÀNG LOẠT...")
+    for vid in video_files:
+        try:
+            process_single_video(vid, tag)
+        except Exception as e:
+            print(f"[!] BỎ QUA VIDEO {vid} DO LỖI: {e}")
+
+if __name__ == "__main__":
+    main()':fontsize=20:fontcolor=white@0.10,"
         f"subtitles=filename='{srt_file}':force_style='FontName=Comfortaa,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
     )
 
