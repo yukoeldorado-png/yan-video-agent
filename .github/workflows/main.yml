@@ -27,22 +27,18 @@ jobs:
           fc-cache -fv
           pip install -q google-genai requests edge-tts git+https://github.com/K07VN/capcut-tts-api.git
 
-      - name: Download uploaded video
+      - name: Download uploaded videos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p input_dir
           gh release download --pattern "*" --dir input_dir
 
-      - name: Run Video Pipeline
+      - name: Run Video Pipeline (Batch Processing)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          EPISODE: "Tập 5"
-        run: python run.py
-
-      - name: Upload Final Video to Release
-        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_TITLE: ${{ github.event.release.name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG=$(gh release view --json tagName -q .tagName)
-          gh release upload $TAG Video_HoanThanh.mp4 --clobber
+        run: python run.py
