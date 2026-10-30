@@ -1,6 +1,7 @@
 name: YaN Studio - Xu Ly Video Tu Dong
 
 on:
+  workflow_dispatch:
   release:
     types: [published, edited]
 
@@ -31,16 +32,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p input_dir
-          gh release download ${{ github.event.release.tag_name }} --dir input_dir
+          gh release download --dir input_dir
 
       - name: Run Video Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          EPISODE: ${{ github.event.release.name || github.event.release.tag_name }}
+          EPISODE: "Tập 5"
         run: python run.py
 
       - name: Upload Final Video to Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} Video_HoanThanh.mp4 --clobber
+          TAG=$(gh release view --json tagName -q .tagName)
+          gh release upload $TAG Video_HoanThanh.mp4 --clobber
