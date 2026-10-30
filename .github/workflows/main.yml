@@ -34,7 +34,7 @@ jobs:
           mkdir -p input_dir
           gh release download --pattern "*" --dir input_dir
 
-      - name: Run Video Pipeline (Batch Processing)
+      - name: Run Video Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RELEASE_BODY: ${{ github.event.release.body }}
@@ -42,3 +42,12 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python run.py
+
+      # ĐẢM BẢO 100%: LƯU VIDEO VÀO MỤC ARTIFACTS ĐỂ TẢI VỀ KỂ CẢ KHI RELEASE BỊ KẸT
+      - name: Upload Video to Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Video_Thanh_Pham
+          path: Video_HoanThanh_*.mp4
+          retention-days: 7
