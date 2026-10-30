@@ -2,10 +2,12 @@ import os, re, time, glob, json, asyncio, subprocess, shutil, edge_tts
 from google import genai
 from google.genai import types
 
+# ================= CẤU HÌNH CƠ BẢN =================
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 CRE_NAME   = os.environ.get("CREATOR", "").strip()
 SUB_NAME   = "IYaNstudio AI"
 
+# Lấy tên cre và sub từ phần mô tả của GitHub Release (nếu có)
 BODY_TEXT = os.environ.get("RELEASE_BODY", "")
 cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
 sub_match = re.search(r'(?i)sub\s*[:=]\s*(.+)', BODY_TEXT)
@@ -15,7 +17,7 @@ CUSTOM_SUB = sub_match.group(1).strip() if sub_match else SUB_NAME
 
 client = genai.Client(api_key=GEMINI_KEY)
 
-# PROMPT TỐI ƯU ĐẶC BIỆT DÀNH RIÊNG CHO GEMINI 3.7 FLASH
+# LUẬT DỊCH THUẬT SIÊU CHẶT CHẼ
 YAN_PROMPT = """
 Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa hoạt hình Trung Quốc.
 TỐI HẬU THƯ QUAN TRỌNG:
@@ -37,16 +39,16 @@ if not os.path.exists(CJK_FONT):
 capcut_client = None
 try:
     from capcut_tts_api import CapCutClient
-    capcut_client = CapCutClient(timeout=45)
+    capcut_client = CapCutClient(timeout=20)
 except: pass
 
 def get_video_dimensions(p):
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", p]
-    try: return int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["width"]), int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout)["streams"][0]["height"])
+    try: return int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True, timeout=10).stdout)["streams"][0]["width"]), int(json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, text=True, timeout=10).stdout)["streams"][0]["height"])
     except: return 1920, 1080
 
 def get_audio_duration(p):
-    try: return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True).stdout.strip())
+    try: return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True, timeout=10).stdout.strip())
     except: return 2.0
 
 def to_seconds(t_str):
@@ -94,48 +96,59 @@ def extract_subtitles_from_text(raw_text):
         valid = [l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]
         txt = " ".join(valid).replace('"', '').strip()
         
+        # Bỏ qua bảng thông báo hệ thống dài thượt (trên 35 từ)
         if txt and len(txt.split()) < 35 and et_sec > st_sec:
             items.append((st_sec, et_sec, txt))
             
     return items
 
-def generate_voice(text, out_p):
+async def generate_voice_async(text, out_p):
     if capcut_client:
-        for _ in range(5):
+        for _ in range(3):
             try:
-                res = capcut_client.generate_speech(text, voice="BV421_vivn_streaming", timeout=30)
-                capcut_client.download_tts_audio(res, out_p)
+                loop = asyncio.get_event_loop()
+                res = await asyncio.wait_for(loop.run_in_executor(None, capcut_client.generate_speech, text, "BV421_vivn_streaming", 15), timeout=18)
+                await asyncio.wait_for(loop.run_in_executor(None, capcut_client.download_tts_audio, res, out_p), timeout=15)
                 if os.path.exists(out_p) and os.path.getsize(out_p) > 0: return True
-            except: time.sleep(1.5)
+            except:
+                await asyncio.sleep(1.0)
     try:
-        asyncio.run(edge_tts.Communicate(text, "vi-VN-HoaiMyNeural", pitch="+16Hz", rate="+8%").save(out_p))
+        await asyncio.wait_for(edge_tts.Communicate(text, "vi-VN-HoaiMyNeural", pitch="+16Hz", rate="+8%").save(out_p), timeout=15)
         return os.path.exists(out_p) and os.path.getsize(out_p) > 0
+    except: return False
+
+def generate_voice(text, out_p):
+    try: return asyncio.run(generate_voice_async(text, out_p))
     except: return False
 
 def process_single_video(video_path, tag_name):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
-    print(f"\n[*] ĐANG XỬ LÝ: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
+    print(f"\n=================================================")
+    print(f"[*] ĐANG XỬ LÝ VIDEO: {base_name}")
+    print(f"=================================================")
 
     clean_vid = f"clean_{base_name}.mp4"
     shutil.copyfile(video_path, clean_vid)
 
+    print("[*] Đang tải video lên Google Gemini...")
     v_file = client.files.upload(file=clean_vid)
-    while v_file.state.name == "PROCESSING":
+    for _ in range(30):
+        if v_file.state.name != "PROCESSING": break
         time.sleep(1.5)
         v_file = client.files.get(name=v_file.name)
 
     config = types.GenerateContentConfig(system_instruction=YAN_PROMPT, temperature=0.1)
-    user_prompt = "Hãy tạo file phụ đề SRT hoàn chỉnh từ 00:00 đến hết video cho toàn bộ lời thoại nhân vật. Định dạng chuẩn bắt đầu từ số 1:"
+    user_prompt = "Hãy tạo file phụ đề SRT hoàn chỉnh từ 00:00 đến hết video cho toàn bộ lời thoại nhân vật. Bắt đầu từ số 1:"
 
     resp = None
-    # 👉 CHỈ DÙNG DUY NHẤT CÁC MODEL CAO CẤP TỪ 3.6 TRỞ LÊN
+    # Chạy lần lượt các model siêu tốc, tốt nhất hiện tại của Gemini
     for m in ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash"]:
         try:
             print(f"[*] Đang bóc sub với model {m}...")
             r = client.models.generate_content(model=m, contents=[v_file, user_prompt], config=config)
             if r and r.text and "-->" in r.text:
                 resp = r
-                print(f"[✓] Model {m} đã xuất phụ đề xuất sắc!")
+                print(f"[✓] Model {m} xuất phụ đề thành công!")
                 break
         except Exception as e:
             print(f"[!] {m} bận: {e}")
@@ -145,12 +158,11 @@ def process_single_video(video_path, tag_name):
     except: pass
     
     if not resp or not resp.text:
-        raise Exception("Không thể lấy phụ đề từ Gemini 3.7 / 3.6!")
+        raise Exception("Không thể lấy phụ đề từ Google Gemini!")
 
     items = extract_subtitles_from_text(resp.text)
-    print(f"[✓] Đã bóc tách thành công {len(items)} câu thoại chuẩn!")
+    print(f"[✓] Đã bóc tách được {len(items)} câu thoại chuẩn!")
     if not items:
-        print("[!] Debug nội dung AI trả về:\n", resp.text[:500])
         raise Exception("Không nhận diện được câu thoại nào!")
 
     srt_file = f"sub_{base_name}.srt"
@@ -158,6 +170,7 @@ def process_single_video(video_path, tag_name):
         for idx, (s, e, t) in enumerate(items, 1):
             f.write(f"{idx}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n")
 
+    print("[*] Đang lồng tiếng CapCut (bảo vệ chống treo ngắt mạng)...")
     inputs, parts = [], []
     temp_dir = f"temp_tts_{base_name}"
     os.makedirs(temp_dir, exist_ok=True)
@@ -169,7 +182,7 @@ def process_single_video(video_path, tag_name):
             max_d = max(0.5, e - s - 0.08)
             chosen_p = p_raw
             if dur > max_d:
-                subprocess.run(["ffmpeg", "-y", "-i", p_raw, "-filter:a", f"atempo={min(1.85, dur/max_d):.2f}", "-vn", p_fit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["ffmpeg", "-nostdin", "-y", "-i", p_raw, "-filter:a", f"atempo={min(1.85, dur/max_d):.2f}", "-vn", p_fit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
                 chosen_p = p_fit
             inputs.extend(["-i", chosen_p])
             d_ms = int(s * 1000)
@@ -179,22 +192,28 @@ def process_single_video(video_path, tag_name):
     tts_audio = f"tts_{base_name}.wav"
     has_audio = False
     if idx > 0:
-        cmd_tts = ["ffmpeg", "-y"] + inputs + ["-filter_complex", "".join(parts) + f"{''.join([f'[a{i}]' for i in range(idx)])}amix=inputs={idx}:dropout_transition=0:normalize=0[out]", "-map", "[out]", tts_audio]
-        subprocess.run(cmd_tts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd_tts = ["ffmpeg", "-nostdin", "-y"] + inputs + ["-filter_complex", "".join(parts) + f"{''.join([f'[a{i}]' for i in range(idx)])}amix=inputs={idx}:dropout_transition=0:normalize=0[out]", "-map", "[out]", tts_audio]
+        subprocess.run(cmd_tts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         if os.path.exists(tts_audio) and os.path.getsize(tts_audio) > 1000:
             has_audio = True
 
     w, h = get_video_dimensions(clean_vid)
-    y1_pct, y2_pct = 0.93, 1.00
+    
+    # Kích thước khung làm mờ mặc định (sát đáy 16:9, che trọn sub cũ)
+    y1_pct, y2_pct = 0.90, 1.00
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = max(24, min((int(h * (y2_pct - y1_pct)) // 2) * 2, h - y_start))
-    center_margin_v = max(4, int((1.0 - (y1_pct + y2_pct)/2.0) * 288 - 4))
+    
+    # Căn giữa phụ đề tuyệt đối vào khung làm mờ
+    y_center = y_start + (crop_h // 2)
+    center_margin_v = max(4, int(h - y_center - (15 / 2)))
 
     cre_cmd = f"drawtext=text='cre - {CUSTOM_CRE}':x=25:y=20:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1," if (CUSTOM_CRE and CUSTOM_CRE != "????") else ""
     t_sub = CUSTOM_SUB.replace("'", "").replace(":", " -")
+    
+    # Vệt mờ chỉ bật lúc có chữ, tắt lúc hết chữ (Dài thêm 0.1s ở đuôi cho mịn)
     en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items]) or "1"
 
-    # ĐÃ XÓA HOÀN TOÀN DÒNG SỐ TẬP
     vf = (
         f"[0:v]split[m][c];"
         f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
@@ -207,51 +226,40 @@ def process_single_video(video_path, tag_name):
 
     output_filename = f"Video_HoanThanh_{base_name}.mp4"
     if has_audio:
-        af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-        cmd_render = ["ffmpeg", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
+        # Dynamic ducking: Giảm 5% lúc nói, 100% tiếng cười/BGM
+        duck_str = "+".join([f"between(t,{max(0, s-0.05):.2f},{e+0.05:.2f})" for s, e, t in items]) or "0"
+        af = f"[0:a]stereotools=mlev=0.1,volume='if({duck_str}, 0.05, 1.0)':eval=frame[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
     else:
-        cmd_render = ["ffmpeg", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
 
-    res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("[*] Đang render video hoàn chỉnh bằng FFmpeg...")
+    res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
     if res.returncode != 0:
         raise Exception(f"Lỗi FFmpeg: {res.stderr[-300:]}")
 
     print(f"[✓] Đã render xong: {output_filename}")
     if tag_name:
-        subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"])
-        print(f"[✓] Đã upload lên Release: {tag_name}")
+        subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"], timeout=60)
+        print(f"[✓] Đã đính kèm video vào mục Release!")
         
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
     files = glob.glob("input_dir/*.*")
     video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
-    if not video_files: raise Exception("Không tìm thấy file video nào trong Release!")
+    if not video_files: raise Exception("Không tìm thấy file video nào tải lên!")
 
     tag = os.environ.get("RELEASE_TAG", "").strip()
     if not tag:
-        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True, timeout=10).stdout.strip()
         
-    print(f"[*] Tìm thấy {len(video_files)} video. Bắt đầu xử lý với Gemini 3.7 / 3.6 Flash...")
+    print(f"[*] TÌM THẤY {len(video_files)} VIDEO. HỆ THỐNG BẮT ĐẦU CHẠY HÀNG LOẠT...")
     for vid in video_files:
-        process_single_video(vid, tag)
-
-if __name__ == "__main__":
-    main()  
-    shutil.rmtree(temp_dir, ignore_errors=True)
-
-def main():
-    files = glob.glob("input_dir/*.*")
-    video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
-    if not video_files: raise Exception("Không tìm thấy file video nào trong Release!")
-
-    tag = os.environ.get("RELEASE_TAG", "").strip()
-    if not tag:
-        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
-        
-    print(f"[*] Tìm thấy {len(video_files)} video. Bắt đầu xử lý...")
-    for vid in video_files:
-        process_single_video(vid, tag)
+        try:
+            process_single_video(vid, tag)
+        except Exception as e:
+            print(f"[!] BỎ QUA VIDEO {vid} DO LỖI: {e}")
 
 if __name__ == "__main__":
     main()
