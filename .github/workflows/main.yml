@@ -11,6 +11,7 @@ permissions:
 jobs:
   process:
     runs-on: ubuntu-latest
+    timeout-minutes: 360 # Thời gian chạy tối đa 3 tiếng, tha hồ ném 10-20 video
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,12 +39,10 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RELEASE_BODY: ${{ github.event.release.body }}
-          RELEASE_TITLE: ${{ github.event.release.name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python run.py
 
-      # ĐẢM BẢO 100%: LƯU VIDEO VÀO MỤC ARTIFACTS ĐỂ TẢI VỀ KỂ CẢ KHI RELEASE BỊ KẸT
       - name: Upload Video to Artifacts
         if: always()
         uses: actions/upload-artifact@v4
