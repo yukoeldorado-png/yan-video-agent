@@ -2,10 +2,9 @@ import os, re, time, glob, json, asyncio, subprocess, shutil, edge_tts
 from google import genai
 from google.genai import types
 
-GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
-EPISODE    = os.environ.get("EPISODE", "Tập 5").strip()
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 CRE_NAME   = os.environ.get("CREATOR", "").strip()
-SUB_NAME   = "YaNstudio AI"
+SUB_NAME   = "IYaNstudio AI"
 
 BODY_TEXT = os.environ.get("RELEASE_BODY", "")
 cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
@@ -16,13 +15,19 @@ CUSTOM_SUB = sub_match.group(1).strip() if sub_match else SUB_NAME
 
 client = genai.Client(api_key=GEMINI_KEY)
 
+# PROMPT TỐI ƯU ĐẶC BIỆT DÀNH RIÊNG CHO GEMINI 3.7 FLASH
 YAN_PROMPT = """
 Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa hoạt hình Trung Quốc.
-TỐI HẬU THƯ:
-1. Dịch TOÀN BỘ video từ 00:00 đến hết video. Tuyệt đối KHÔNG bỏ dở giữa chừng.
-2. CHỈ dịch lời thoại do nhân vật nói ra mồm. TUYỆT ĐỐI BỎ QUA các bảng thông báo hệ thống, bảng thuộc tính chữ dài.
-3. Mỗi câu thoại chỉ nằm trên 1 DÒNG ĐƠN (tối đa 10-12 từ).
-4. Định dạng chuẩn: 00:mm:ss,mmm --> 00:mm:ss,mmm. CẤM DẤU NGOẶC KÉP. Không xuất lời dẫn.
+TỐI HẬU THƯ QUAN TRỌNG:
+1. Dịch TOÀN BỘ video từ 00:00 đến hết video. BẮT BUỘC xuất ra định dạng file .SRT tiêu chuẩn.
+2. Cấu trúc chuẩn từng entry bắt đầu từ số 1:
+1
+00:00:01,000 --> 00:00:03,000
+Câu thoại dịch tiếng Việt ngắn gọn
+
+3. CHỈ dịch lời thoại do nhân vật nói ra mồm. TUYỆT ĐỐI BỎ QUA bảng thông báo hệ thống, bảng thuộc tính chữ dài.
+4. Mỗi câu thoại chỉ nằm trên 1 DÒNG ĐƠN (tối đa 10-12 từ).
+5. Tuyệt đối không viết thêm bất kỳ lời dẫn hay giải thích nào khác ngoài cấu trúc file SRT.
 """
 
 CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -51,14 +56,14 @@ def to_seconds(t_str):
         m = int(parts[0])
         s_parts = parts[1].split(',')
         s = int(s_parts[0])
-        ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+        ms = int(s_parts[1][:3].ljust(3, '0')) if len(s_parts) > 1 else 0
         return m * 60 + s + ms / 1000.0
     elif len(parts) == 3:
         h = int(parts[0])
         m = int(parts[1])
         s_parts = parts[2].split(',')
         s = int(s_parts[0])
-        ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+        ms = int(s_parts[1][:3].ljust(3, '0')) if len(s_parts) > 1 else 0
         return h * 3600 + m * 60 + s + ms / 1000.0
     return 0.0
 
@@ -66,14 +71,16 @@ def format_time(sec):
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = int(sec % 60)
-    ms = int((sec - int(sec)) * 1000)
+    ms = int(round((sec - int(sec)) * 1000))
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-# TRÍCH XUẤT PHỤ ĐỀ TRỰC TIẾP CHUẨN XÁC 100%
 def extract_subtitles_from_text(raw_text):
     raw_text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
+    raw_text = re.sub(r'^```(?:srt)?\s*', '', raw_text, flags=re.MULTILINE)
+    raw_text = re.sub(r'\s*```$', '', raw_text, flags=re.MULTILINE)
     raw_text = raw_text.replace('：', ':').replace('，', ',').replace('—>', '-->').replace('->', '-->')
-    ts_pattern = r'((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)'
+    
+    ts_pattern = r'((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)\s*(?:-->|->|—|–|~|-)\s*((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)'
     matches = list(re.finditer(ts_pattern, raw_text))
     
     items = []
@@ -107,7 +114,6 @@ def generate_voice(text, out_p):
 
 def process_single_video(video_path, tag_name):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
-    ep_display = base_name.replace("_", " ").replace("-", " ")
     print(f"\n[*] ĐANG XỬ LÝ: {base_name} | Cre: {CUSTOM_CRE or 'Ẩn'} | Sub: {CUSTOM_SUB}")
 
     clean_vid = f"clean_{base_name}.mp4"
@@ -119,34 +125,39 @@ def process_single_video(video_path, tag_name):
         v_file = client.files.get(name=v_file.name)
 
     config = types.GenerateContentConfig(system_instruction=YAN_PROMPT, temperature=0.1)
+    user_prompt = "Hãy tạo file phụ đề SRT hoàn chỉnh từ 00:00 đến hết video cho toàn bộ lời thoại nhân vật. Định dạng chuẩn bắt đầu từ số 1:"
+
     resp = None
-    for m in ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+    # 👉 CHỈ DÙNG DUY NHẤT CÁC MODEL CAO CẤP TỪ 3.6 TRỞ LÊN
+    for m in ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash"]:
         try:
-            print(f"[*] Đang dịch với model {m}...")
-            r = client.models.generate_content(model=m, contents=[v_file, "Dịch toàn bộ video sang tiếng Việt."], config=config)
-            if r and r.text: resp = r; break
+            print(f"[*] Đang bóc sub với model {m}...")
+            r = client.models.generate_content(model=m, contents=[v_file, user_prompt], config=config)
+            if r and r.text and "-->" in r.text:
+                resp = r
+                print(f"[✓] Model {m} đã xuất phụ đề xuất sắc!")
+                break
         except Exception as e:
             print(f"[!] {m} bận: {e}")
-            time.sleep(1.5)
+            time.sleep(2.0)
             
     try: client.files.delete(name=v_file.name)
     except: pass
     
     if not resp or not resp.text:
-        raise Exception("Không thể lấy phụ đề từ Gemini!")
+        raise Exception("Không thể lấy phụ đề từ Gemini 3.7 / 3.6!")
 
     items = extract_subtitles_from_text(resp.text)
-    print(f"[✓] Đã bóc tách thành công {len(items)} câu thoại!")
+    print(f"[✓] Đã bóc tách thành công {len(items)} câu thoại chuẩn!")
     if not items:
-        raise Exception("Không nhận diện được câu thoại nào trong văn bản dịch!")
+        print("[!] Debug nội dung AI trả về:\n", resp.text[:500])
+        raise Exception("Không nhận diện được câu thoại nào!")
 
-    # Ghi file SRT chuẩn
     srt_file = f"sub_{base_name}.srt"
     with open(srt_file, "w", encoding="utf-8") as f:
         for idx, (s, e, t) in enumerate(items, 1):
             f.write(f"{idx}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n")
 
-    # Tạo giọng đọc CapCut
     inputs, parts = [], []
     temp_dir = f"temp_tts_{base_name}"
     os.makedirs(temp_dir, exist_ok=True)
@@ -181,16 +192,15 @@ def process_single_video(video_path, tag_name):
 
     cre_cmd = f"drawtext=text='cre - {CUSTOM_CRE}':x=25:y=20:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1," if (CUSTOM_CRE and CUSTOM_CRE != "????") else ""
     t_sub = CUSTOM_SUB.replace("'", "").replace(":", " -")
-    t_ep = ep_display.replace("'", "").replace(":", " -")
     en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items]) or "1"
 
+    # ĐÃ XÓA HOÀN TOÀN DÒNG SỐ TẬP
     vf = (
         f"[0:v]split[m][c];"
         f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
         f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
         f"[v1]{cre_cmd}"
         f"drawtext=text='sub - {t_sub}':x=25:y=42:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
-        f"drawtext=text='{t_ep}':x=w-tw-30:y=20:fontsize=22:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
         f"subtitles=filename='{srt_file}':force_style='FontName=Comfortaa,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
     )
@@ -204,7 +214,6 @@ def process_single_video(video_path, tag_name):
 
     res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
-        print("[!] FFmpeg Error Log:\n", res.stderr[-1000:])
         raise Exception(f"Lỗi FFmpeg: {res.stderr[-300:]}")
 
     print(f"[✓] Đã render xong: {output_filename}")
@@ -212,6 +221,23 @@ def process_single_video(video_path, tag_name):
         subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"])
         print(f"[✓] Đã upload lên Release: {tag_name}")
         
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+def main():
+    files = glob.glob("input_dir/*.*")
+    video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
+    if not video_files: raise Exception("Không tìm thấy file video nào trong Release!")
+
+    tag = os.environ.get("RELEASE_TAG", "").strip()
+    if not tag:
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True).stdout.strip()
+        
+    print(f"[*] Tìm thấy {len(video_files)} video. Bắt đầu xử lý với Gemini 3.7 / 3.6 Flash...")
+    for vid in video_files:
+        process_single_video(vid, tag)
+
+if __name__ == "__main__":
+    main()  
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
