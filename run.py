@@ -3,15 +3,16 @@ from google import genai
 from google.genai import types
 
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
-DEFAULT_SUB = "YaNstudio AI"
-DEFAULT_CRE = ""
+EPISODE    = os.environ.get("EPISODE", "Tập 5").strip()
+CRE_NAME   = os.environ.get("CREATOR", "").strip()
+SUB_NAME   = "YaNstudio AI"
 
 BODY_TEXT = os.environ.get("RELEASE_BODY", "")
 cre_match = re.search(r'(?i)cre\s*[:=]\s*(.+)', BODY_TEXT)
 sub_match = re.search(r'(?i)sub\s*[:=]\s*(.+)', BODY_TEXT)
 
-CUSTOM_CRE = cre_match.group(1).strip() if cre_match else DEFAULT_CRE
-CUSTOM_SUB = sub_match.group(1).strip() if sub_match else DEFAULT_SUB
+CUSTOM_CRE = cre_match.group(1).strip() if cre_match else CRE_NAME
+CUSTOM_SUB = sub_match.group(1).strip() if sub_match else SUB_NAME
 
 client = genai.Client(api_key=GEMINI_KEY)
 
@@ -43,41 +44,52 @@ def get_audio_duration(p):
     try: return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True).stdout.strip())
     except: return 2.0
 
-def clean_time(t):
-    t = t.strip().replace('.', ',')
-    parts = t.split(':')
+def to_seconds(t_str):
+    t_str = t_str.strip().replace('.', ',')
+    parts = t_str.split(':')
     if len(parts) == 2:
-        s = parts[1] if ',' in parts[1] else parts[1] + ',000'
-        return f"00:{int(parts[0]):02d}:{s}"
+        m = int(parts[0])
+        s_parts = parts[1].split(',')
+        s = int(s_parts[0])
+        ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+        return m * 60 + s + ms / 1000.0
     elif len(parts) == 3:
-        s = parts[2] if ',' in parts[2] else parts[2] + ',000'
-        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{s}"
-    return t
+        h = int(parts[0])
+        m = int(parts[1])
+        s_parts = parts[2].split(',')
+        s = int(s_parts[0])
+        ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+        return h * 3600 + m * 60 + s + ms / 1000.0
+    return 0.0
 
-def rebuild_srt(raw):
-    raw = raw.replace('：', ':').replace('，', ',').replace('—>', '-->').replace('->', '-->')
+def format_time(sec):
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int((sec - int(sec)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+# TRÍCH XUẤT PHỤ ĐỀ TRỰC TIẾP CHUẨN XÁC 100%
+def extract_subtitles_from_text(raw_text):
+    raw_text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
+    raw_text = raw_text.replace('：', ':').replace('，', ',').replace('—>', '-->').replace('->', '-->')
     ts_pattern = r'((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,\.]\d{1,3})?)'
-    matches = list(re.finditer(ts_pattern, raw))
-    if not matches: return raw
-    entries = []
+    matches = list(re.finditer(ts_pattern, raw_text))
+    
+    items = []
     for i in range(len(matches)):
-        st, et = clean_time(matches[i].group(1)), clean_time(matches[i].group(2))
+        st_sec = to_seconds(matches[i].group(1))
+        et_sec = to_seconds(matches[i].group(2))
         p1 = matches[i].end()
-        p2 = matches[i+1].start() if i+1 < len(matches) else len(raw)
-        lines = [l.strip() for l in raw[p1:p2].split('\n') if l.strip()]
+        p2 = matches[i+1].start() if i+1 < len(matches) else len(raw_text)
+        
+        lines = [l.strip() for l in raw_text[p1:p2].split('\n') if l.strip()]
         valid = [l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]
         txt = " ".join(valid).replace('"', '').strip()
-        if txt and len(txt.split()) < 35:
-            entries.append((st, et, txt))
-    return "\n\n".join([f"{idx}\n{s} --> {e}\n{t}" for idx, (s, e, t) in enumerate(entries, 1)])
-
-def parse_srt(p):
-    items = []
-    with open(p, "r", encoding="utf-8") as f: content = f.read()
-    for m in re.finditer(r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n(.*?)(?=\n\n|\Z)', content, re.DOTALL):
-        h1, mn1, s1 = m.group(2).split(':'); s1, ms1 = s1.split(',')
-        h2, mn2, s2 = m.group(3).split(':'); s2, ms2 = s2.split(',')
-        items.append((int(h1)*3600+int(mn1)*60+int(s1)+int(ms1)/1000.0, int(h2)*3600+int(mn2)*60+int(s2)+int(ms2)/1000.0, m.group(4).strip().replace('\n', ' ')))
+        
+        if txt and len(txt.split()) < 35 and et_sec > st_sec:
+            items.append((st_sec, et_sec, txt))
+            
     return items
 
 def generate_voice(text, out_p):
@@ -123,16 +135,23 @@ def process_single_video(video_path, tag_name):
     if not resp or not resp.text:
         raise Exception("Không thể lấy phụ đề từ Gemini!")
 
-    srt_file = f"sub_{base_name}.srt"
-    with open(srt_file, "w", encoding="utf-8") as f: f.write(rebuild_srt(resp.text))
+    items = extract_subtitles_from_text(resp.text)
+    print(f"[✓] Đã bóc tách thành công {len(items)} câu thoại!")
+    if not items:
+        raise Exception("Không nhận diện được câu thoại nào trong văn bản dịch!")
 
-    items = parse_srt(srt_file)
+    # Ghi file SRT chuẩn
+    srt_file = f"sub_{base_name}.srt"
+    with open(srt_file, "w", encoding="utf-8") as f:
+        for idx, (s, e, t) in enumerate(items, 1):
+            f.write(f"{idx}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n")
+
+    # Tạo giọng đọc CapCut
     inputs, parts = [], []
     temp_dir = f"temp_tts_{base_name}"
     os.makedirs(temp_dir, exist_ok=True)
     idx = 0
     for s, e, txt in items:
-        if not txt or txt.startswith("["): continue
         p_raw, p_fit = f"{temp_dir}/r_{idx}.mp3", f"{temp_dir}/f_{idx}.mp3"
         if generate_voice(txt, p_raw):
             dur = get_audio_duration(p_raw)
@@ -147,7 +166,12 @@ def process_single_video(video_path, tag_name):
             idx += 1
 
     tts_audio = f"tts_{base_name}.wav"
-    subprocess.run(["ffmpeg", "-y"] + inputs + ["-filter_complex", "".join(parts) + f"{''.join([f'[a{i}]' for i in range(idx)])}amix=inputs={idx}:dropout_transition=0:normalize=0[out]", "-map", "[out]", tts_audio], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    has_audio = False
+    if idx > 0:
+        cmd_tts = ["ffmpeg", "-y"] + inputs + ["-filter_complex", "".join(parts) + f"{''.join([f'[a{i}]' for i in range(idx)])}amix=inputs={idx}:dropout_transition=0:normalize=0[out]", "-map", "[out]", tts_audio]
+        subprocess.run(cmd_tts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(tts_audio) and os.path.getsize(tts_audio) > 1000:
+            has_audio = True
 
     w, h = get_video_dimensions(clean_vid)
     y1_pct, y2_pct = 0.93, 1.00
@@ -157,7 +181,8 @@ def process_single_video(video_path, tag_name):
 
     cre_cmd = f"drawtext=text='cre - {CUSTOM_CRE}':x=25:y=20:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1," if (CUSTOM_CRE and CUSTOM_CRE != "????") else ""
     t_sub = CUSTOM_SUB.replace("'", "").replace(":", " -")
-    en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items if t]) or "1"
+    t_ep = ep_display.replace("'", "").replace(":", " -")
+    en_str = "+".join([f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items]) or "1"
 
     vf = (
         f"[0:v]split[m][c];"
@@ -165,14 +190,22 @@ def process_single_video(video_path, tag_name):
         f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
         f"[v1]{cre_cmd}"
         f"drawtext=text='sub - {t_sub}':x=25:y=42:fontsize=16:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
-        f"drawtext=text='{ep_display}':x=w-tw-30:y=20:fontsize=22:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
+        f"drawtext=text='{t_ep}':x=w-tw-30:y=20:fontsize=22:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
         f"subtitles=filename='{srt_file}':force_style='FontName=Comfortaa,FontSize=15,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
     )
-    af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
 
     output_filename = f"Video_HoanThanh_{base_name}.mp4"
-    subprocess.run(["ffmpeg", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename], check=True)
+    if has_audio:
+        af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        cmd_render = ["ffmpeg", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
+    else:
+        cmd_render = ["ffmpeg", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
+
+    res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        print("[!] FFmpeg Error Log:\n", res.stderr[-1000:])
+        raise Exception(f"Lỗi FFmpeg: {res.stderr[-300:]}")
 
     print(f"[✓] Đã render xong: {output_filename}")
     if tag_name:
