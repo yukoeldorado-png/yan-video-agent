@@ -74,7 +74,6 @@ def format_time(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def extract_subtitles_from_text(raw_text):
-    # Cắt bỏ mọi suy nghĩ <think>...</think> của AI mới
     raw_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL | re.IGNORECASE)
     raw_text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
     raw_text = re.sub(r'^```(?:srt)?\s*', '', raw_text, flags=re.MULTILINE)
@@ -154,7 +153,6 @@ def process_single_video(video_path, tag_name):
     items = extract_subtitles_from_text(resp.text)
     print(f"[✓] Đã bóc tách được {len(items)} câu thoại chuẩn!")
     
-    # BẬT ĐÈN PHA DEBUG NẾU AI LẢI NHẢI TRẢ VỀ 0 CÂU
     if not items:
         print("\n" + "="*50)
         print("🚨 LỖI NGHIÊM TRỌNG: AI TRẢ VỀ ĐỊNH DẠNG SAI!")
@@ -220,6 +218,40 @@ def process_single_video(video_path, tag_name):
     if has_audio:
         duck_str = "+".join([f"between(t,{max(0, s-0.05):.2f},{e+0.05:.2f})" for s, e, t in items]) or "0"
         af = f"[0:a]stereotools=mlev=0.1,volume='if({duck_str}, 0.05, 1.0)':eval=frame[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
+    else:
+        cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
+
+    print("[*] Đang render video hoàn chỉnh bằng FFmpeg...")
+    res = subprocess.run(cmd_render, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
+    if res.returncode != 0:
+        raise Exception(f"Lỗi FFmpeg: {res.stderr[-300:]}")
+
+    print(f"[✓] Đã render xong: {output_filename}")
+    if tag_name:
+        subprocess.run(["gh", "release", "upload", tag_name, output_filename, "--clobber"], timeout=60)
+        print(f"[✓] Đã đính kèm video vào mục Release!")
+        
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+def main():
+    files = glob.glob("input_dir/*.*")
+    video_files = sorted([f for f in files if f.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.flv')) and "video_hoanthanh" not in f.lower()])
+    if not video_files: raise Exception("Không tìm thấy file video nào tải lên!")
+
+    tag = os.environ.get("RELEASE_TAG", "").strip()
+    if not tag:
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True, timeout=10).stdout.strip()
+        
+    print(f"[*] TÌM THẤY {len(video_files)} VIDEO. HỆ THỐNG BẮT ĐẦU CHẠY HÀNG LOẠT...")
+    for vid in video_files:
+        try:
+            process_single_video(vid, tag)
+        except Exception as e:
+            print(f"[!] BỎ QUA VIDEO {vid} DO LỖI: {e}")
+
+if __name__ == "__main__":
+    main()0.1,volume='if({duck_str}, 0.05, 1.0)':eval=frame[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
     else:
         cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_filename]
