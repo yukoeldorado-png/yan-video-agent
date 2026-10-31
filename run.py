@@ -327,6 +327,9 @@ if __name__ == "__main__":
     if has_audio:
         # Dynamic ducking: Giảm 5% lúc nói, 100% tiếng cười/BGM
         duck_str = "+".join([f"between(t,{max(0, s-0.05):.2f},{e+0.05:.2f})" for s, e, t in items]) or "0"
+        output_filename = f"Video_HoanThanh_{base_name}.mp4"
+    if has_audio:
+        duck_str = "+".join([f"between(t,{max(0, s-0.05):.2f},{e+0.05:.2f})" for s, e, t in items]) or "0"
         af = f"[0:a]stereotools=mlev=0.1,volume='if({duck_str}, 0.05, 1.0)':eval=frame[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         cmd_render = ["ffmpeg", "-nostdin", "-y", "-i", clean_vid, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_filename]
     else:
@@ -351,7 +354,7 @@ def main():
 
     tag = os.environ.get("RELEASE_TAG", "").strip()
     if not tag:
-        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", "-q", ".tagName"], capture_output=True, text=True, timeout=10).stdout.strip()
+        tag = subprocess.run(["gh", "release", "view", "--json", "tagName", -q, ".tagName"], capture_output=True, text=True, timeout=10).stdout.strip()
         
     print(f"[*] TÌM THẤY {len(video_files)} VIDEO. HỆ THỐNG BẮT ĐẦU CHẠY HÀNG LOẠT...")
     for vid in video_files:
